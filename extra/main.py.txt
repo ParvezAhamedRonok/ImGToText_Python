@@ -1,0 +1,543 @@
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+# =========================================================
+# ENVIRONMENT — set before importing Paddle/PaddleOCR
+# =========================================================
+
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("FLAGS_enable_pir_api", "0")
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+
+# =========================================================
+# IMPORTS
+# =========================================================
+
+from dotenv import load_dotenv
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from ocr_engine import process_image
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ocr_api")
+
+
+# =========================================================
+# ENVIRONMENT CONFIGURATION
+# =========================================================
+
+load_dotenv()
+
+
+def get_positive_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+        if value < 1:
+            raise ValueError
+        return value
+    except (TypeError, ValueError):
+        return default
+
+
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "http://localhost:3000",
+).strip().rstrip("/")
+
+MAX_FILE_SIZE_MB = get_positive_int(
+    "MAX_FILE_SIZE_MB",
+    15,
+)
+
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+
+MAX_ANSWER_IMAGES = 4
+
+# Maximum total images per batch: 1 question + 4 answers.
+MAX_TOTAL_IMAGES = 1 + MAX_ANSWER_IMAGES
+
+# Process only one OCR operation at a time in this worker.
+# This is conservative for low-memory CPU servers.
+OCR_CONCURRENCY = get_positive_int(
+    "OCR_CONCURRENCY",
+    1,
+)
+
+# Keep this aligned with ocr_engine.py.
+MAX_IMAGE_PIXELS = 30_000_000
+
+ALLOWED_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+}
+
+OCR_SEMAPHORE = asyncio.Semaphore(OCR_CONCURRENCY)
+
+
+# =========================================================
+# LIFESPAN
+# =========================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("OCR API starting.")
+    logger.info("OCR device: CPU")
+    logger.info("OCR concurrency per worker: %s", OCR_CONCURRENCY)
+
+    # Importing ocr_engine initializes the model.
+    # Model initialization is intentionally not repeated here.
+    yield
+
+    logger.info("OCR API shutting down.")
+
+
+# =========================================================
+# FASTAPI APPLICATION
+# =========================================================
+
+app = FastAPI(
+    title="IELTS Plus OCR API",
+    description="English image-to-text API powered by PaddleOCR",
+    version="3.1.0",
+    lifespan=lifespan,
+)
+
+
+# =========================================================
+# CORS
+# =========================================================
+
+ALLOWED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "FRONTEND_URLS",
+        FRONTEND_URL,
+    ).split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+
+
+# =========================================================
+# ROOT
+# =========================================================
+
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "IELTS Plus OCR API",
+        "ocr": "PaddleOCR",
+        "language": "English",
+        "device": "CPU",
+    }
+
+
+# =========================================================
+# HEALTH CHECK
+# =========================================================
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+
+@app.get("/api/ocr/health")
+async def ocr_health():
+    return {
+        "status": "ready",
+        "engine": "PaddleOCR",
+        "language": "English",
+        "device": "CPU",
+    }
+
+
+# =========================================================
+# READ AND VALIDATE UPLOAD
+# =========================================================
+
+async def read_image_file(file: UploadFile) -> bytes:
+    """
+    Validate content type and size before OCR.
+    Reads in chunks so oversized uploads are rejected early.
+    """
+
+    if file is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Image file is required.",
+        )
+
+    content_type = (file.content_type or "").lower().strip()
+
+    if content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Only JPG, JPEG, PNG and WEBP images are supported.",
+        )
+
+    chunks: list[bytes] = []
+    total_size = 0
+
+    try:
+        while True:
+            chunk = await file.read(1024 * 1024)
+
+            if not chunk:
+                break
+
+            total_size += len(chunk)
+
+            if total_size > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Image is too large. Maximum size is "
+                        f"{MAX_FILE_SIZE_MB} MB."
+                    ),
+                )
+
+            chunks.append(chunk)
+
+    finally:
+        await file.close()
+
+    if total_size == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded image is empty.",
+        )
+
+    data = b"".join(chunks)
+
+    # Verify that the file is actually a supported image.
+    # Content-Type alone can be spoofed.
+    try:
+        import cv2
+        import numpy as np
+
+        image_array = np.frombuffer(data, dtype=np.uint8)
+        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+        if image is None:
+            raise ValueError("Image could not be decoded.")
+
+        height, width = image.shape[:2]
+
+        if height < 1 or width < 1:
+            raise ValueError("Invalid image dimensions.")
+
+        if height * width > MAX_IMAGE_PIXELS:
+            raise HTTPException(
+                status_code=413,
+                detail="Image dimensions are too large.",
+            )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or unsupported image file.",
+        ) from exc
+
+    return data
+
+
+# =========================================================
+# PROCESS ONE IMAGE
+# =========================================================
+
+async def process_one_image(
+    image_bytes: bytes,
+    label: str,
+) -> dict:
+    """
+    Run CPU-bound OCR in a worker thread.
+    A semaphore limits simultaneous inference.
+    """
+
+    logger.info(
+        "Processing %s (%.2f MB)",
+        label,
+        len(image_bytes) / (1024 * 1024),
+    )
+
+    try:
+        async with OCR_SEMAPHORE:
+            result = await asyncio.to_thread(
+                process_image,
+                image_bytes,
+            )
+
+    except Exception as exc:
+        logger.exception("OCR failed for %s", label)
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process {label}.",
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=500,
+            detail=f"OCR returned an invalid result for {label}.",
+        )
+
+    # The engine may return success=False rather than raising.
+    if result.get("success") is False:
+        error_message = result.get("error")
+
+        # Do not expose internal exception details to clients.
+        logger.warning(
+            "OCR engine reported failure for %s: %s",
+            label,
+            error_message,
+        )
+
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unable to extract text from {label}.",
+        )
+
+    text = result.get("text", "")
+
+    if not isinstance(text, str):
+        text = str(text or "")
+
+    text = text.strip()
+
+    confidence = result.get("confidence")
+
+    if confidence is not None:
+        try:
+            confidence = float(confidence)
+
+            if not (0.0 <= confidence <= 100.0):
+                confidence = None
+
+        except (TypeError, ValueError):
+            confidence = None
+
+        if confidence is not None:
+            confidence = round(confidence, 2)
+
+    logger.info(
+        "Completed %s: text_length=%s confidence=%s",
+        label,
+        len(text),
+        confidence,
+    )
+
+    return {
+        "text": text,
+        "confidence": confidence,
+    }
+
+
+# =========================================================
+# OCR BATCH ENDPOINT
+# =========================================================
+
+@app.post("/api/ocr/batch")
+async def ocr_batch(
+    question: Annotated[
+        UploadFile | None,
+        File(description="Optional question image"),
+    ] = None,
+    answers: Annotated[
+        list[UploadFile] | None,
+        File(description="Up to four answer images"),
+    ] = None,
+):
+    """
+    Multipart fields:
+        question: optional single image
+        answers: zero to four images
+
+    Response keys remain compatible with the existing frontend.
+    """
+
+    answers = answers or []
+
+    # -----------------------------------------------------
+    # Validate batch size
+    # -----------------------------------------------------
+
+    if len(answers) > MAX_ANSWER_IMAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {MAX_ANSWER_IMAGES} answer images are allowed.",
+        )
+
+    if question is None and not answers:
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload at least one image.",
+        )
+
+    uploads: list[tuple[str, UploadFile]] = []
+
+    if question is not None:
+        uploads.append(("question image", question))
+
+    for index, answer in enumerate(answers, start=1):
+        uploads.append((f"answer image {index}", answer))
+
+    # -----------------------------------------------------
+    # Validate ALL uploads before running any OCR.
+    # -----------------------------------------------------
+
+    image_data: list[tuple[str, bytes]] = []
+
+    try:
+        for label, upload in uploads:
+            data = await read_image_file(upload)
+            image_data.append((label, data))
+
+    finally:
+        # Close files even if a later upload fails validation.
+        for _, upload in uploads:
+            if not upload.file.closed:
+                await upload.close()
+
+    # -----------------------------------------------------
+    # Run OCR
+    # -----------------------------------------------------
+
+    question_text = ""
+    question_confidence = None
+
+    answer_texts: list[str] = []
+    answer_confidences: list[float] = []
+
+    for label, data in image_data:
+        result = await process_one_image(data, label)
+
+        if label == "question image":
+            question_text = result["text"]
+            question_confidence = result["confidence"]
+
+        else:
+            # Preserve the frontend's existing behavior:
+            # only non-empty answer text is included.
+            if result["text"]:
+                answer_texts.append(result["text"])
+
+                if result["confidence"] is not None:
+                    answer_confidences.append(
+                        result["confidence"]
+                    )
+
+    # -----------------------------------------------------
+    # Aggregate answer confidence
+    # -----------------------------------------------------
+
+    answer_confidence = None
+
+    if answer_confidences:
+        answer_confidence = round(
+            sum(answer_confidences) / len(answer_confidences),
+            2,
+        )
+
+    # -----------------------------------------------------
+    # Combine answers
+    # -----------------------------------------------------
+
+    answer_text = "\n\n".join(answer_texts).strip()
+
+    # -----------------------------------------------------
+    # Frontend-compatible response
+    # -----------------------------------------------------
+
+    response = {
+        "success": True,
+        "question": question_text,
+        "question_confidence": question_confidence,
+        "answers": answer_texts,
+        "answer_text": answer_text,
+        "answer_confidence": answer_confidence,
+        "total_answers": len(answer_texts),
+    }
+
+    logger.info(
+        "Batch complete: question_detected=%s answers_detected=%s",
+        bool(question_text),
+        len(answer_texts),
+    )
+
+    return response
+
+
+# =========================================================
+# HTTP ERROR HANDLER
+# =========================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(
+    request: Request,
+    exc: HTTPException,
+):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "detail": exc.detail,
+        },
+        headers=exc.headers,
+    )
+
+
+# =========================================================
+# UNEXPECTED ERROR HANDLER
+# =========================================================
+
+@app.exception_handler(Exception)
+async def unexpected_exception_handler(
+    request: Request,
+    exc: Exception,
+):
+    logger.exception(
+        "Unexpected API error on %s",
+        request.url.path,
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "detail": "Internal OCR server error. Please try again.",
+        },
+    )

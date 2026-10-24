@@ -1,0 +1,465 @@
+from __future__ import annotations
+
+import logging
+import os
+import re
+import threading
+from dataclasses import dataclass
+from typing import Any
+
+# =========================================================
+# ENVIRONMENT — set before importing PaddleOCR
+# =========================================================
+
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("FLAGS_enable_pir_api", "0")
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+
+import cv2
+import numpy as np
+from paddleocr import PaddleOCR
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+OCR_LANGUAGE = "en"
+OCR_VERSION = "PP-OCRv5"
+
+OCR_DEVICE = "cpu"
+CPU_THREADS = 4
+ENABLE_MKLDNN = False
+
+MAX_IMAGE_DIMENSION = 2000
+
+# Protect a shared OCR instance from concurrent inference.
+OCR_LOCK = threading.Lock()
+
+# Keep OpenCV from oversubscribing CPU threads.
+cv2.setNumThreads(1)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ocr_engine")
+
+
+# =========================================================
+# RESULT
+# =========================================================
+
+@dataclass
+class OCRResult:
+    text: str
+    confidence: float
+
+
+# =========================================================
+# INITIALIZE OCR ONCE
+# =========================================================
+
+def create_ocr() -> PaddleOCR:
+    logger.info("Initializing PaddleOCR...")
+
+    engine = PaddleOCR(
+        lang=OCR_LANGUAGE,
+        ocr_version=OCR_VERSION,
+        device=OCR_DEVICE,
+        cpu_threads=CPU_THREADS,
+        enable_mkldnn=ENABLE_MKLDNN,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
+
+    logger.info(
+        "PaddleOCR ready: language=%s device=%s threads=%s",
+        OCR_LANGUAGE,
+        OCR_DEVICE,
+        CPU_THREADS,
+    )
+
+    return engine
+
+
+# Model initialization happens once when this module loads.
+ocr = create_ocr()
+
+
+# =========================================================
+# CLEAN TEXT
+# =========================================================
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+
+    text = str(text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove control characters except newline and tab.
+    text = "".join(
+        ch for ch in text
+        if ch in "\n\t" or ord(ch) >= 32
+    )
+
+    lines = []
+
+    for line in text.split("\n"):
+        line = re.sub(r"[ \t]+", " ", line).strip()
+
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines).strip()
+
+
+# =========================================================
+# DECODE IMAGE
+# =========================================================
+
+def load_image(image_bytes: bytes) -> np.ndarray:
+    if not image_bytes:
+        raise ValueError("Image data is empty.")
+
+    # Prevent unreasonably large uploads from consuming
+    # excessive memory before decoding.
+    if len(image_bytes) > 15 * 1024 * 1024:
+        raise ValueError("Image exceeds the 15 MB limit.")
+
+    array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise ValueError("Invalid or unsupported image.")
+
+    height, width = image.shape[:2]
+
+    if height < 1 or width < 1:
+        raise ValueError("Invalid image dimensions.")
+
+    # Additional pixel limit against decompression bombs.
+    if height * width > 30_000_000:
+        raise ValueError("Image dimensions are too large.")
+
+    return image
+
+
+# =========================================================
+# RESIZE IMAGE
+# =========================================================
+
+def resize_image(image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    largest = max(height, width)
+
+    if largest <= MAX_IMAGE_DIMENSION:
+        return image
+
+    scale = MAX_IMAGE_DIMENSION / float(largest)
+
+    new_width = max(1, round(width * scale))
+    new_height = max(1, round(height * scale))
+
+    logger.info(
+        "Resizing image from %sx%s to %sx%s",
+        width, height, new_width, new_height,
+    )
+
+    return cv2.resize(
+        image,
+        (new_width, new_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+# =========================================================
+# RESULT EXTRACTION
+# =========================================================
+
+def result_to_dict(item: Any) -> dict | None:
+    """
+    Support PaddleOCR 3.x result objects and dictionaries.
+    """
+
+    if isinstance(item, dict):
+        data = item
+
+    else:
+        data = None
+
+        # PaddleOCR 3.x result objects commonly expose .json.
+        if hasattr(item, "json"):
+            try:
+                data = item.json
+
+                if callable(data):
+                    data = data()
+
+            except Exception:
+                data = None
+
+        if data is None and hasattr(item, "to_json"):
+            try:
+                data = item.to_json()
+            except Exception:
+                data = None
+
+    if isinstance(data, str):
+        import json
+
+        try:
+            data = json.loads(data)
+        except (ValueError, TypeError):
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    # Some versions wrap fields inside "res".
+    if isinstance(data.get("res"), dict):
+        data = data["res"]
+
+    return data
+
+
+# =========================================================
+# PARSE OCR OUTPUT
+# =========================================================
+
+def parse_result(
+    result: Any,
+) -> tuple[list[str], list[float], list[list[float]]]:
+
+    texts: list[str] = []
+    scores: list[float] = []
+    boxes: list[list[float]] = []
+
+    if result is None:
+        return texts, scores, boxes
+
+    try:
+        items = list(result)
+    except TypeError:
+        items = [result]
+
+    for item in items:
+        data = result_to_dict(item)
+
+        if not data:
+            continue
+
+        rec_texts = data.get("rec_texts", [])
+        rec_scores = data.get("rec_scores", [])
+        rec_boxes = data.get("rec_boxes", [])
+
+        for index, raw_text in enumerate(rec_texts or []):
+            text = str(raw_text).strip()
+
+            if not text:
+                continue
+
+            try:
+                score = float(rec_scores[index])
+                if not np.isfinite(score):
+                    score = 0.0
+            except (IndexError, TypeError, ValueError):
+                score = 0.0
+
+            box = []
+
+            try:
+                box = (
+                    np.asarray(rec_boxes[index])
+                    .reshape(-1)
+                    .astype(float)
+                    .tolist()
+                )
+            except (IndexError, TypeError, ValueError):
+                pass
+
+            texts.append(text)
+            scores.append(score)
+            boxes.append(box)
+
+    return texts, scores, boxes
+
+
+# =========================================================
+# ORDER TEXT
+# =========================================================
+
+def sort_text_items(
+    texts: list[str],
+    scores: list[float],
+    boxes: list[list[float]],
+) -> tuple[list[str], list[float]]:
+
+    items = []
+
+    for index, text in enumerate(texts):
+        score = scores[index] if index < len(scores) else 0.0
+        box = boxes[index] if index < len(boxes) else []
+
+        x = float(index)
+        y = float(index)
+        height = 0.0
+
+        # rec_boxes format: [x1, y1, x2, y2]
+        if len(box) >= 4:
+            x1, y1, x2, y2 = box[:4]
+
+            x = float(x1)
+            y = (float(y1) + float(y2)) / 2.0
+            height = abs(float(y2) - float(y1))
+
+        elif len(box) >= 2:
+            x, y = float(box[0]), float(box[1])
+
+        items.append({
+            "x": x,
+            "y": y,
+            "height": height,
+            "text": text,
+            "score": score,
+        })
+
+    # Group text boxes into approximate visual lines.
+    # This is more robust than sorting only by top y.
+    items.sort(key=lambda item: (item["y"], item["x"]))
+
+    lines = []
+
+    for item in items:
+        best_line = None
+        best_distance = float("inf")
+
+        for line in lines:
+            avg_y = sum(x["y"] for x in line) / len(line)
+
+            tolerance = max(
+                8.0,
+                item["height"] * 0.5,
+                max(x["height"] for x in line) * 0.5,
+            )
+
+            distance = abs(item["y"] - avg_y)
+
+            if distance <= tolerance and distance < best_distance:
+                best_line = line
+                best_distance = distance
+
+        if best_line is None:
+            lines.append([item])
+        else:
+            best_line.append(item)
+
+    lines.sort(
+        key=lambda line: sum(x["y"] for x in line) / len(line)
+    )
+
+    sorted_items = []
+
+    for line in lines:
+        line.sort(key=lambda item: item["x"])
+        sorted_items.extend(line)
+
+    return (
+        [item["text"] for item in sorted_items],
+        [item["score"] for item in sorted_items],
+    )
+
+
+# =========================================================
+# RUN OCR
+# =========================================================
+
+def run_paddle_ocr(image: np.ndarray) -> OCRResult:
+    try:
+        # Serialize inference on this shared model instance.
+        with OCR_LOCK:
+            result = ocr.predict(image)
+
+        texts, scores, boxes = parse_result(result)
+
+    except Exception:
+        logger.exception("PaddleOCR inference failed.")
+        raise
+
+    if not texts:
+        return OCRResult(text="", confidence=0.0)
+
+    texts, scores = sort_text_items(texts, scores, boxes)
+
+    final_text = clean_text("\n".join(texts))
+
+    if not final_text:
+        return OCRResult(text="", confidence=0.0)
+
+    valid_scores = [
+        score for score in scores
+        if np.isfinite(score) and 0.0 <= score <= 1.0
+    ]
+
+    confidence = (
+        sum(valid_scores) / len(valid_scores) * 100.0
+        if valid_scores
+        else 0.0
+    )
+
+    return OCRResult(
+        text=final_text,
+        confidence=round(confidence, 2),
+    )
+
+
+# =========================================================
+# PUBLIC API
+# =========================================================
+
+def extract_text(image_bytes: bytes) -> OCRResult:
+    image = load_image(image_bytes)
+    image = resize_image(image)
+
+    logger.info(
+        "Processing image: %sx%s",
+        image.shape[1],
+        image.shape[0],
+    )
+
+    return run_paddle_ocr(image)
+
+
+def process_image(image_bytes: bytes) -> dict:
+    """
+    Synchronous function intended for FastAPI.
+    Call it using asyncio.to_thread() in an async route.
+    """
+
+    try:
+        result = extract_text(image_bytes)
+
+        return {
+            "text": result.text,
+            "confidence": result.confidence,
+            "success": True,
+        }
+
+    except ValueError as exc:
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "success": False,
+            "error": str(exc),
+        }
+
+    except Exception:
+        logger.exception("OCR processing failed.")
+
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "success": False,
+            "error": "OCR processing failed. Please try again.",
+        }
